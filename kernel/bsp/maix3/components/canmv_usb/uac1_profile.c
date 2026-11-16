@@ -14,7 +14,7 @@ static uint32_t le24(const uint8_t *p)
 
 struct candidate {
     struct uac1_alt alt;
-    int streaming, pcm, format, ep_count, invalid;
+    int streaming, pcm, format, rate_control_required, ep_count, invalid;
 };
 
 /* UAC1 Type-I PCM formats can advertise discrete rates or a closed range. */
@@ -37,6 +37,7 @@ static void pick(struct candidate *c, const uint8_t *collection,
                  unsigned count, struct uac1_profile *out)
 {
     if (!c->streaming || !c->pcm || !c->format || c->invalid || c->ep_count != 1 ||
+        (c->rate_control_required && !c->alt.set_rate) ||
         c->alt.max_packet < (UAC1_RATE / 1000u) * 2u * c->alt.channels)
         return;
     for (unsigned i = 0; i < count; ++i) {
@@ -94,6 +95,7 @@ int uac1_parse(const uint8_t *raw, size_t len, uint8_t control,
                 c.pcm = d[0] >= 7 && le16(d + 5) == 1;
             if (d[2] == 2 && supports_rate(d)) {
                 c.format = 1;
+                c.rate_control_required = d[7] != 1;
                 c.alt.channels = d[4];
             }
         } else if (c.streaming && d[1] == 5) {

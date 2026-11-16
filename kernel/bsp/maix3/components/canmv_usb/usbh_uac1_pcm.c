@@ -406,7 +406,8 @@ INIT_DEVICE_EXPORT(pcm_init);
 static int audio_connect(struct usbh_hubport *port, uint8_t ctrl)
 {
     struct uac1_profile profile;
-    if (!pcm.initialized || port->speed != USB_SPEED_FULL || !port->parent->is_roothub ||
+    if (!pcm.initialized || port->speed != USB_SPEED_FULL || !port->parent ||
+        !port->parent->is_roothub ||
         uac1_parse(port->raw_config_desc, port->config.config_desc.wTotalLength, ctrl, &profile)) {
         /* An unmatched AudioControl interface must not fail enumeration of
          * independent interfaces (e.g. the HID buttons on a composite card). */
@@ -452,4 +453,29 @@ static const struct usbh_class_driver audio_ac = {
 CLASS_INFO_DEFINE const struct usbh_class_info canmv_uac1_class_info = {
     .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
     .class = 1, .subclass = 1, .protocol = 0, .class_driver = &audio_ac
+};
+
+/* Only mark the specific AS interfaces negotiated by our AC function as
+ * claimed. AudioControl owns the stream buffers and the disconnect path. */
+static int streaming_connect(struct usbh_hubport *port, uint8_t intf)
+{
+    if (!pcm.initialized)
+        goto unclaimed;
+    rt_mutex_take(&pcm.lock, RT_WAITING_FOREVER);
+    int owned = pcm.port == port &&
+        ((pcm.profile.capture.channels && pcm.profile.capture.interface == intf) ||
+         (pcm.profile.playback.channels && pcm.profile.playback.interface == intf));
+    rt_mutex_release(&pcm.lock);
+    if (owned) return 0;
+unclaimed:
+    port->config.intf[intf].class_driver = NULL;
+    return 0;
+}
+
+static const struct usbh_class_driver audio_as = {
+    .driver_name = "uac1_stream", .connect = streaming_connect
+};
+CLASS_INFO_DEFINE const struct usbh_class_info canmv_uac1_stream_info = {
+    .match_flags = USB_CLASS_MATCH_INTF_CLASS | USB_CLASS_MATCH_INTF_SUBCLASS | USB_CLASS_MATCH_INTF_PROTOCOL,
+    .class = 1, .subclass = 2, .protocol = 0, .class_driver = &audio_as
 };

@@ -43,6 +43,9 @@ no stream. The ring capacity is 64 KiB; the kernel pump maintains four
 Run `python3 tests/test_profile.py` here to compile and exercise the C
 descriptor parser against a captured 253-byte USB configuration, alternate
 rate ordering, malformed configurations and unsupported endpoints.
+Run `python3 tests/runtime/run.py` to exercise the production PCM operations
+using a deterministic HCD shim, including packet lengths, transfer completion,
+software queues, drain accounting and unplug/replug with stale file handles.
 On a candidate board, compare `lsusb -v`, `lsusb -t` and the capability ioctl.
 Expected interface drivers for selected streams are `uac1_pcm` (control) and
 `uac1_stream` (streaming). Record actual PCM capture, independent audible

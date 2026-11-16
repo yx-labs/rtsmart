@@ -227,6 +227,13 @@ menu "Components Configuration"
                                 config CHERRY_USB_HOST_ENABLE_CLASS_UVC
                                     bool "Enable UVC"
                                     default n
+                                config CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+                                    bool "CanMV UAC1 half-duplex PCM devices"
+                                    depends on DWC2_DRV_DMA_DESC_ENABLE && ENABLE_CANMV_USB_HOST && !RT_USING_SMP
+                                    default n
+                                    help
+                                      Full Speed UAC1 PCM16 capture/playback at 48 kHz.
+                                      Exposes /dev/uac0i, /dev/uac0c and /dev/uac0p.
                             endif
 
                             config CHERRY_USB_HOST_ENABLE_CLASS_CDC_ACM

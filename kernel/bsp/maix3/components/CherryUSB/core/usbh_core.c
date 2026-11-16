@@ -174,9 +174,11 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
         USB_LOG_ERR("unexpected config descriptor 0x%02x\r\n", desc->bDescriptorType);
         return -USB_ERR_INVAL;
     } else {
-        if (length <= USB_SIZEOF_CONFIG_DESC) {
+        if (length == USB_SIZEOF_CONFIG_DESC) {
             return 0;
         }
+        if (length < USB_SIZEOF_CONFIG_DESC || length != desc->wTotalLength)
+            return -USB_ERR_INVAL;
 #if 0
         USB_LOG_DBG("Config Descriptor:\r\n");
         USB_LOG_DBG("bLength: 0x%02x             \r\n", desc->bLength);
@@ -204,9 +206,14 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
 
         usb_memset(hport->config.intf, 0, sizeof(struct usbh_interface) * CONFIG_USBHOST_MAX_INTERFACES);
 
-        while (p[DESC_bLength] && (desc_len <= length)) {
+        while (desc_len < length) {
+            if (length - desc_len < 2 || p[DESC_bLength] < 2 ||
+                p[DESC_bLength] > length - desc_len)
+                return -USB_ERR_INVAL;
             switch (p[DESC_bDescriptorType]) {
                 case USB_DESCRIPTOR_TYPE_INTERFACE:
+                    if (p[DESC_bLength] < USB_SIZEOF_INTERFACE_DESC)
+                        return -USB_ERR_INVAL;
                     intf_desc = (struct usb_interface_descriptor *)p;
                     cur_iface = intf_desc->bInterfaceNumber;
                     cur_alt_setting = intf_desc->bAlternateSetting;
@@ -214,18 +221,15 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
                     cur_ep = 0;
                     if (cur_iface > (CONFIG_USBHOST_MAX_INTERFACES - 1)) {
                         USB_LOG_ERR("Interface num overflow\r\n");
-                        while (1) {
-                        }
+                        return -USB_ERR_INVAL;
                     }
                     if (cur_alt_setting > (CONFIG_USBHOST_MAX_INTF_ALTSETTINGS - 1)) {
                         USB_LOG_ERR("Interface altsetting num overflow\r\n");
-                        while (1) {
-                        }
+                        return -USB_ERR_INVAL;
                     }
                     if (cur_ep_num > CONFIG_USBHOST_MAX_ENDPOINTS) {
                         USB_LOG_ERR("Endpoint num overflow\r\n");
-                        while (1) {
-                        }
+                        return -USB_ERR_INVAL;
                     }
 #if 1
                     USB_LOG_RAW("Interface Descriptor:\r\n");
@@ -240,9 +244,12 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
                     USB_LOG_RAW("\tiInterface: 0x%02x         \r\n", intf_desc->iInterface);
 #endif
                     usb_memcpy(&hport->config.intf[cur_iface].altsetting[cur_alt_setting].intf_desc, intf_desc, 9);
-                    hport->config.intf[cur_iface].altsetting_num = cur_alt_setting + 1;
+                    if (hport->config.intf[cur_iface].altsetting_num <= cur_alt_setting)
+                        hport->config.intf[cur_iface].altsetting_num = cur_alt_setting + 1;
                     break;
                 case USB_DESCRIPTOR_TYPE_ENDPOINT:
+                    if (p[DESC_bLength] < 7 || cur_iface == 0xff || cur_ep >= cur_ep_num)
+                        return -USB_ERR_INVAL;
                     ep_desc = (struct usb_endpoint_descriptor *)p;
                     usb_memcpy(&hport->config.intf[cur_iface].altsetting[cur_alt_setting].ep[cur_ep].ep_desc, ep_desc, 7);
                     cur_ep++;
@@ -252,8 +259,8 @@ static int parse_config_descriptor(struct usbh_hubport *hport, struct usb_config
                     break;
             }
             /* skip to next descriptor */
-            p += p[DESC_bLength];
             desc_len += p[DESC_bLength];
+            p += p[DESC_bLength];
         }
     }
     return 0;
@@ -582,7 +589,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /* Read the full size of the configuration data */
     uint16_t wTotalLength = ((struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid])->wTotalLength;
 
-    if (wTotalLength > CONFIG_USBHOST_REQUEST_BUFFER_LEN) {
+    if (wTotalLength < USB_SIZEOF_CONFIG_DESC || wTotalLength > CONFIG_USBHOST_REQUEST_BUFFER_LEN) {
         ret = -USB_ERR_NOMEM;
         USB_LOG_ERR("wTotalLength %d is overflow, default is %d\r\n", wTotalLength, CONFIG_USBHOST_REQUEST_BUFFER_LEN);
         goto errout;
@@ -599,6 +606,13 @@ int usbh_enumerate(struct usbh_hubport *hport)
         USB_LOG_ERR("Failed to get full config descriptor,errorcode:%d\r\n", ret);
         goto errout;
     }
+#ifdef CHERRY_USB_HC_DRV_DWC2
+    /* DWC2 reports setup bytes in addition to the returned control payload. */
+    if (ret < USB_SIZEOF_SETUP_PACKET + wTotalLength) {
+        ret = -USB_ERR_INVAL;
+        goto errout;
+    }
+#endif
 
     ret = parse_config_descriptor(hport, (struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid], wTotalLength);
     if (ret < 0) {

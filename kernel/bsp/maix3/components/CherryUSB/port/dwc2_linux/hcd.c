@@ -16,6 +16,7 @@
  */
 
 #include "hcd.h"
+#include "usbh_root_diag.h"
 #include "ipc/waitqueue.h"
 
 __WEAK void usb_hc_low_level_init(struct usbh_bus *bus)
@@ -1887,12 +1888,16 @@ int usb_hc_init(struct usbh_bus *bus)
     struct resource *res;
     int retval;
 
+    const char *stage = "board-phy";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     /* will install irq */
     usb_hc_low_level_init(bus);
 
     hsotg = rt_calloc(1, sizeof(*hsotg));
-    if (!hsotg)
+    if (!hsotg) {
+        usbh_root_note(ROOT_INIT, "alloc-hcd", -ENOMEM, 0);
         return -ENOMEM;
+    }
 
     /* ioremap in main->usbh_initialize */
     hsotg->regs = (volatile void *)bus->hcd.reg_base;
@@ -1914,6 +1919,8 @@ int usb_hc_init(struct usbh_bus *bus)
      * Before performing any core related operations
      * check core version.
      */
+    stage = "core-id";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     retval = dwc2_check_core_version(hsotg);
     if (retval)
         goto error;
@@ -1922,11 +1929,15 @@ int usb_hc_init(struct usbh_bus *bus)
      * Reset before dwc2_get_hwparams() then it could get power-on real
      * reset value form registers.
      */
+    stage = "core-reset";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     retval = dwc2_core_reset(hsotg, false);
     if (retval)
         goto error;
 
     /* Detect config values from hardware */
+    stage = "hw-params";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     retval = dwc2_get_hwparams(hsotg);
     if (retval)
         goto error;
@@ -1938,6 +1949,8 @@ int usb_hc_init(struct usbh_bus *bus)
      */
 
 
+    stage = "params";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     retval = dwc2_init_params(hsotg);
     if (retval)
         goto error;
@@ -1955,6 +1968,8 @@ int usb_hc_init(struct usbh_bus *bus)
     }
 
 
+    stage = "start-hcd";
+    usbh_root_note(ROOT_INIT, stage, 0, 0);
     retval = dwc2_hcd_init(hsotg);
     if (retval) {
         goto error;
@@ -1966,6 +1981,8 @@ int usb_hc_init(struct usbh_bus *bus)
     return 0;
 
 error:
+    usbh_root_note(ROOT_INIT, stage, retval, 0);
+    (void)stage;
     if (bus->hcd.hcd_priv == hsotg) {
         bus->hcd.hcd_priv = NULL;
     }
@@ -2280,6 +2297,119 @@ int usbh_roothub_control(struct usbh_bus *bus,
 }
 #else
 /* Handles hub class-specific requests */
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+/* Call with the HCD IRQ lock held. Never read host-only HPRT if the core
+ * is not in live host mode. */
+static int dwc2_root_sample(struct dwc2_hsotg *hsotg, u32 *hprt, u32 *gate)
+{
+    *gate = (hsotg->bus_suspended ? 1u : 0u) | (hsotg->hibernated ? 2u : 0u) |
+            (hsotg->in_ppd ? 4u : 0u);
+    int mode = *gate ? -1 : !!dwc2_is_host_mode(hsotg);
+    *hprt = mode == 1 ? dwc2_readl(hsotg, HPRT0) : 0;
+    return mode;
+}
+
+static void dwc2_root_frame_snapshot(struct dwc2_hsotg *hsotg, enum usbh_frame_mark mark, int mode)
+{
+    u32 num = 0, interval = 0, cfg = 0;
+    if (mode == 1) {
+        num = dwc2_readl(hsotg, HFNUM);
+        interval = dwc2_readl(hsotg, HFIR);
+        cfg = dwc2_readl(hsotg, HCFG);
+    }
+    usbh_root_frames(mark, mode, num, interval, cfg);
+}
+
+/* Record only the first real address-zero device-descriptor submission and
+ * its HCD return during the first reset experiment. No diagnostic USB URB. */
+void dwc2_trace_first_setup(struct usbh_bus *bus, int done, int result)
+{
+    enum usbh_root_mark mark = done ? ROOT_MARK_SETUP_DONE : ROOT_MARK_SETUP;
+    if (!usbh_root_trace_wanted(mark)) return;
+    struct dwc2_hsotg *hsotg = dwc2_hcd_to_hsotg(&bus->hcd);
+    if (!hsotg) return;
+    rt_base_t irq = rt_spin_lock_irqsave(&hsotg->lock);
+    u32 hprt, gate;
+    int mode = dwc2_root_sample(hsotg, &hprt, &gate);
+    if (done) usbh_root_setup_result(result);
+    else dwc2_root_frame_snapshot(hsotg, ROOT_FRAME_SETUP, mode);
+    usbh_root_mark(mark, mode, hprt);
+    rt_spin_unlock_irqrestore(&hsotg->lock, irq);
+}
+
+/* Called from the common IRQ handler while hsotg->lock is already held. */
+void dwc2_trace_startup_disconnect(struct dwc2_hsotg *hsotg)
+{
+    if (usbh_root_trace_wanted(ROOT_MARK_DISCONNECT)) {
+        u32 hprt, gate;
+        int mode = dwc2_root_sample(hsotg, &hprt, &gate);
+        dwc2_root_frame_snapshot(hsotg, ROOT_FRAME_IRQ, mode);
+        usbh_root_mark(ROOT_MARK_DISCONNECT, mode, hprt);
+    }
+}
+
+static int dwc2_reset_root_port(struct dwc2_hsotg *hsotg)
+{
+    const u32 w1c = HPRT0_ENA | HPRT0_CONNDET | HPRT0_ENACHG | HPRT0_OVRCURRCHG;
+    u32 hprt, gate;
+    int policy = usbh_root_active_policy();
+    rt_base_t irq = rt_spin_lock_irqsave(&hsotg->lock);
+    int mode = dwc2_root_sample(hsotg, &hprt, &gate);
+    if (mode != 1 || !hsotg->flags.b.port_connect_status ||
+        (hprt & (HPRT0_CONNSTS | HPRT0_PWR)) != (HPRT0_CONNSTS | HPRT0_PWR) ||
+        (hprt & (HPRT0_OVRCURRACT | HPRT0_SUSP | HPRT0_RST))) {
+        rt_spin_unlock_irqrestore(&hsotg->lock, irq);
+        return -ENODEV;
+    }
+    dwc2_writel(hsotg, 0, PCGCTL);
+    dwc2_writel(hsotg, (hprt & ~w1c) | HPRT0_RST, HPRT0);
+    if (policy >= 0) {
+        mode = dwc2_root_sample(hsotg, &hprt, &gate);
+        usbh_root_mark(ROOT_MARK_ASSERT, mode, hprt);
+    }
+    rt_spin_unlock_irqrestore(&hsotg->lock, irq);
+
+    msleep(policy == ROOT_BOOT_LONG ? 100 : 50);
+
+    irq = rt_spin_lock_irqsave(&hsotg->lock);
+    mode = dwc2_root_sample(hsotg, &hprt, &gate);
+    if (mode == 1 && (hprt & HPRT0_RST)) {
+        /* Even if the card was removed during reset, release our pulse.
+         * Do not replay the port power/suspend state from 50-100 ms ago. */
+        dwc2_writel(hsotg, hprt & ~(w1c | HPRT0_RST), HPRT0);
+        hsotg->lx_state = DWC2_L0;
+    }
+    if (policy >= 0) {
+        mode = dwc2_root_sample(hsotg, &hprt, &gate);
+        usbh_root_mark(ROOT_MARK_CLEAR, mode, hprt);
+        dwc2_root_frame_snapshot(hsotg, ROOT_FRAME_CLEAR, mode);
+    }
+    rt_spin_unlock_irqrestore(&hsotg->lock, irq);
+    return mode == 1 ? 0 : -ENODEV;
+}
+
+/* A cold-attached device can be powered before the port-change IRQ is
+ * enabled. Reconcile this missing rising edge in the hub worker. */
+static void dwc2_reconcile_root_connection(struct dwc2_hsotg *hsotg)
+{
+    rt_base_t level = rt_spin_lock_irqsave(&hsotg->lock);
+    u32 hprt0, gate;
+    int mode = dwc2_root_sample(hsotg, &hprt0, &gate);
+    usbh_root_hw(mode, hprt0, hsotg->flags.d32, gate);
+    if (!hsotg->flags.b.port_connect_status && mode == 1) {
+        if ((hprt0 & (HPRT0_PWR | HPRT0_CONNSTS)) == (HPRT0_PWR | HPRT0_CONNSTS) &&
+            !(hprt0 & (HPRT0_OVRCURRACT | HPRT0_SUSP | HPRT0_RST))) {
+            /* Acknowledge a still-pending CONNDET only. ENA and the other
+             * write-one-to-clear bits must not change the live port. */
+            if (hprt0 & HPRT0_CONNDET)
+                dwc2_writel(hsotg, hprt0 & ~(HPRT0_ENA | HPRT0_ENACHG | HPRT0_OVRCURRCHG), HPRT0);
+            dwc2_hcd_connect(hsotg);
+        }
+    }
+    rt_spin_unlock_irqrestore(&hsotg->lock, level);
+}
+#endif
+
 int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
                          uint8_t *buf)
 {
@@ -2436,6 +2566,9 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
         if (!windex || windex > 1)
             goto error;
 
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+        dwc2_reconcile_root_connection(hsotg);
+#endif
         port_status = 0;
         if (hsotg->flags.b.port_connect_status_change)
             port_status |= USB_PORT_STAT_C_CONNECTION << 16;
@@ -2526,6 +2659,12 @@ int usbh_roothub_control(struct usbh_bus *bus, struct usb_setup_packet *setup,
         if (wvalue != USB_PORT_FEAT_TEST && (!windex || windex > 1))
             goto error;
 
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+        if (wvalue == USB_PORT_FEAT_RESET) {
+            retval = dwc2_reset_root_port(hsotg);
+            break;
+        }
+#endif
         if (!hsotg->flags.b.port_connect_status) {
             /*
              * The port is disconnected, which means the core is

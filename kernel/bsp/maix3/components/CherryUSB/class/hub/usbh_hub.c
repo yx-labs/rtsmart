@@ -5,6 +5,7 @@
  */
 #include "usbh_core.h"
 #include "usbh_hub.h"
+#include "usbh_root_diag.h"
 
 #undef USB_DBG_TAG
 #define USB_DBG_TAG "usbh_hub"
@@ -18,6 +19,9 @@
 #define DELAY_TIME_AFTER_RESET 200
 #define DELAY_TIME_BEFORE_ENUMERATE 20
 #define DELAY_TIME_ENUM_NOTCONN_BACKOFF 100
+#define HUB_ENUM_ATTEMPTS      3
+#define ROOT_RECHECK_MS        1000
+#define ROOT_RECHECK_ATTEMPTS  2
 
 #define EXTHUB_FIRST_INDEX 2
 
@@ -285,6 +289,7 @@ static int usbh_hub_set_depth(struct usbh_hub *hub, uint16_t depth)
 static void usbh_hubport_release(struct usbh_hubport *child)
 {
     if (child->connected) {
+        USBH_ROOT_PORT_NOTE(child, ROOT_RELEASE, NULL, 0, 0);
         child->connected = false;
         usbh_free_devaddr(child);
         for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
@@ -532,19 +537,140 @@ static int usbh_hub_disconnect(struct usbh_hubport *hport, uint8_t intf)
 }
 #endif
 
-static void usbh_hubport_enumerate_thread(void *argument)
+static int usbh_hub_check_attachment(struct usbh_hub *hub, uint8_t port, struct hub_port_status *status)
 {
-    struct usbh_hubport *child = (struct usbh_hubport *)argument;
-
-    if (usbh_enumerate(child) < 0) {
-        /** release child sources */
-        usbh_hubport_release(child);
-        USB_LOG_ERR("Port %u enumerate fail\r\n", child->port);
-    }
-    usb_osal_thread_delete(NULL);
+    int ret = usbh_hub_get_portstatus(hub, port, status);
+    if (ret < 0)
+        return ret;
+    if (!(status->wPortStatus & HUB_PORT_STATUS_CONNECTION) ||
+        (status->wPortChange & HUB_PORT_STATUS_C_CONNECTION))
+        return -USB_ERR_NOTCONN;
+    if (status->wPortStatus & HUB_PORT_STATUS_OVERCURRENT)
+        return -USB_ERR_IO;
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+    if (hub->is_roothub && (!(status->wPortStatus & HUB_PORT_STATUS_POWER) ||
+        (status->wPortStatus & HUB_PORT_STATUS_SUSPEND)))
+        return -USB_ERR_IO;
+#endif
+    return 0;
 }
 
-static void usbh_hub_events(struct usbh_hub *hub)
+/* A reset returning success says nothing about the preceding enumeration.
+ * Give each attempt a fresh USB address, endpoint state and class ownership. */
+static int usbh_hub_enumerate_port(struct usbh_hub *hub, uint8_t port, unsigned attempts)
+{
+    struct usbh_hubport *child = &hub->child[port - 1];
+    struct hub_port_status status;
+    int ret;
+
+    usbh_hubport_release(child);
+    for (unsigned attempt = 1; attempt <= attempts; attempt++) {
+        /* The previous EP0 failure can also mean a real unplug. */
+        if (hub->is_roothub) usbh_root_note(ROOT_PHASE, "pre-reset-status", 0, 0);
+        ret = usbh_hub_check_attachment(hub, port, &status);
+        if (ret < 0)
+            return ret;
+
+        int policy = hub->is_roothub ? usbh_root_begin_trial() : -1;
+        if (policy == ROOT_BOOT_SETTLE || policy == ROOT_BOOT_LONG) {
+            /* Only the first stable attach early in this host's lifetime.
+             * Do not reset a replacement device or a port that went away. */
+            usbh_root_note(ROOT_PHASE, "startup-settle", 0, 0);
+            usb_osal_msleep(1000);
+            ret = usbh_hub_check_attachment(hub, port, &status);
+            if (ret < 0) {
+                usbh_root_end_trial();
+                return ret;
+            }
+        }
+        if (hub->is_roothub) usbh_root_note(ROOT_RESET, NULL, 0, 0);
+        ret = usbh_hub_set_feature(hub, port, HUB_PORT_FEATURE_RESET);
+        if (ret < 0) {
+            if (policy >= 0) usbh_root_end_trial();
+            return ret;
+        }
+        bool early = policy == ROOT_BOOT_EARLY || policy == ROOT_BOOT_EARLY30;
+        uint32_t released = early ? usb_osal_timestamp() : 0;
+        usb_osal_msleep(early ? (policy == ROOT_BOOT_EARLY30 ? 30 : 15) : DELAY_TIME_AFTER_RESET);
+        if (hub->is_roothub) usbh_root_note(ROOT_PHASE, "post-reset-status", 0, 0);
+        for (;;) {
+            ret = usbh_hub_check_attachment(hub, port, &status);
+            if (ret < 0 || !early || (!(status.wPortStatus & HUB_PORT_STATUS_RESET) &&
+                (status.wPortStatus & HUB_PORT_STATUS_ENABLE))) break;
+            uint32_t elapsed = usb_osal_timestamp() - released;
+            if (elapsed >= DELAY_TIME_AFTER_RESET) break;
+            uint32_t remaining = DELAY_TIME_AFTER_RESET - elapsed;
+            usb_osal_msleep(remaining < 5 ? remaining : 5);
+        }
+        if (policy >= 0) usbh_root_end_trial();
+        if (ret < 0)
+            return ret;
+        if ((status.wPortStatus & HUB_PORT_STATUS_RESET) ||
+            !(status.wPortStatus & HUB_PORT_STATUS_ENABLE))
+            return -USB_ERR_IO;
+        if (status.wPortChange & HUB_PORT_STATUS_C_RESET) {
+            if (hub->is_roothub) usbh_root_note(ROOT_PHASE, "clear-reset", 0, 0);
+            ret = usbh_hub_clear_feature(hub, port, HUB_PORT_FEATURE_C_RESET);
+            if (ret < 0)
+                return ret;
+        }
+
+        uint8_t speed = USB_SPEED_FULL;
+        if (status.wPortStatus & HUB_PORT_STATUS_HIGH_SPEED)
+            speed = USB_SPEED_HIGH;
+        else if (status.wPortStatus & HUB_PORT_STATUS_LOW_SPEED)
+            speed = USB_SPEED_LOW;
+#ifdef CONFIG_USBHOST_XHCI
+        else {
+            extern uint8_t usbh_get_port_speed(struct usbh_hub *hub, const uint8_t port);
+            uint8_t super_speed = usbh_get_port_speed(hub, port);
+            if (super_speed > USB_SPEED_HIGH)
+                speed = super_speed;
+        }
+#endif
+        usb_memset(child, 0, sizeof(*child));
+#ifdef CHERRY_USB_HC_DRV_DWC2
+        if (!hub->parent) {
+            child->tt = &hub->tt;
+            child->ttport = 1;
+        } else if (speed != USB_SPEED_HIGH && hub->parent->speed == USB_SPEED_HIGH) {
+            if (!hub->tt.hub)
+                return -USB_ERR_IO;
+            child->tt = &hub->tt;
+            child->ttport = port;
+        }
+#endif
+        child->mutex = usb_osal_mutex_create();
+        if (!child->mutex)
+            return -USB_ERR_NOMEM;
+        child->parent = hub;
+        child->port = port;
+        child->speed = speed;
+        child->bus = hub->bus;
+        child->connected = true;
+
+        /* A validated early sample already includes the reset-recovery time. */
+        if (!early) usb_osal_msleep(DELAY_TIME_BEFORE_ENUMERATE);
+        if (hub->is_roothub) usbh_root_note(ROOT_ENUM_TRY, NULL, 0, 0);
+        ret = usbh_enumerate(child);
+        if (ret >= 0) {
+            USB_LOG_INFO("Enumerated %s device on bus %u hub %u port %u\r\n",
+                         speed_table[speed], hub->bus->busid, hub->index, port);
+            return 0;
+        }
+        USBH_ROOT_PORT_NOTE(child, ROOT_ERROR, NULL, ret, 0);
+        usbh_hubport_release(child);
+        USB_LOG_WRN("Hub %u port %u enumeration attempt %u failed (%d)\r\n",
+                    hub->index, port, attempt, ret);
+        if (attempt == attempts)
+            return ret;
+        if (ret == -USB_ERR_NOTCONN)
+            usb_osal_msleep(DELAY_TIME_ENUM_NOTCONN_BACKOFF);
+    }
+    return -USB_ERR_INVAL;
+}
+
+static void usbh_hub_events(struct usbh_hub *hub, bool rescan, uint8_t *root_retries)
 {
     struct usbh_hubport *child;
     struct hub_port_status port_status;
@@ -553,20 +679,27 @@ static void usbh_hub_events(struct usbh_hub *hub)
     uint16_t portchange;
     uint16_t mask;
     uint16_t feat;
-    uint8_t speed;
     int ret;
 
     if (!hub->connected) {
         return;
     }
 
-    portchange_index = hub->int_buffer[0];
-    hub->int_buffer[0] &= ~portchange_index;
+    if (hub->is_roothub) usbh_root_note(ROOT_DISPATCH, NULL, rescan, 0);
+    /* A timeout must not consume a genuine interrupt queued on another CPU. */
+    portchange_index = 0;
+    if (!rescan) {
+        size_t flags = usb_osal_enter_critical_section();
+        portchange_index = hub->int_buffer[0];
+        hub->int_buffer[0] &= ~portchange_index;
+        usb_osal_leave_critical_section(flags);
+    }
 
     for (uint8_t port = 0; port < hub->hub_desc.bNbrPorts; port++) {
         USB_LOG_DBG("Port change:0x%02x\r\n", portchange_index);
 
-        if (!(portchange_index & (1 << (port + 1)))) {
+        child = &hub->child[port];
+        if (rescan ? child->connected : !(portchange_index & (1 << (port + 1)))) {
             continue;
         }
         portchange_index &= ~(1 << (port + 1));
@@ -575,6 +708,7 @@ static void usbh_hub_events(struct usbh_hub *hub)
         /* Read hub port status */
         ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
         if (ret < 0) {
+            if (hub->is_roothub) usbh_root_note(ROOT_ERROR, "read-status", ret, 0);
             USB_LOG_ERR("Failed to read port %u status, errorcode: %d\r\n", port + 1, ret);
             continue;
         }
@@ -584,6 +718,8 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
         USB_LOG_DBG("port %u, status:0x%02x, change:0x%02x\r\n", port + 1, portstatus, portchange);
 
+        if (hub->is_roothub) usbh_root_note(ROOT_PORT_STATUS, NULL, portstatus, portchange);
+
         /* First, clear all change bits */
         mask = 1;
         feat = HUB_PORT_FEATURE_C_CONNECTION;
@@ -591,8 +727,9 @@ static void usbh_hub_events(struct usbh_hub *hub)
             if (portchange & mask) {
                 ret = usbh_hub_clear_feature(hub, port + 1, feat);
                 if (ret < 0) {
+                    if (hub->is_roothub) usbh_root_note(ROOT_ERROR, "clear-change", ret, 0);
                     USB_LOG_ERR("Failed to clear port %u, change mask:%04x, errorcode:%d\r\n", port + 1, mask, ret);
-                    continue;
+                    break;
                 }
                 portchange &= (~mask);
             }
@@ -600,10 +737,24 @@ static void usbh_hub_events(struct usbh_hub *hub)
             feat++;
         }
 
+        if (portchange)
+            continue; /* A failed CLEAR_FEATURE will be observed on the next check. */
         portchange = port_status.wPortChange;
+        bool changed = (portchange & HUB_PORT_STATUS_C_CONNECTION) != 0;
+        bool retry = false;
+        if (root_retries) {
+            if (changed || !(portstatus & HUB_PORT_STATUS_CONNECTION))
+                root_retries[port] = 0;
+            else if (rescan && !child->connected && (portstatus & HUB_PORT_STATUS_POWER) &&
+                     !(portstatus & (HUB_PORT_STATUS_OVERCURRENT | HUB_PORT_STATUS_SUSPEND)) &&
+                     root_retries[port] < ROOT_RECHECK_ATTEMPTS) {
+                root_retries[port]++;
+                retry = true;
+            }
+        }
 
-        /* Second, if port changes, debounces first */
-        if (portchange & HUB_PORT_STATUS_C_CONNECTION) {
+        /* Debounce both physical change notifications and recovery attempts. */
+        if (changed || retry) {
             uint16_t connection = 0;
             uint16_t debouncestable = 0;
             for (uint32_t debouncetime = 0; debouncetime < HUB_DEBOUNCE_TIMEOUT; debouncetime += HUB_DEBOUNCE_STEP) {
@@ -639,167 +790,19 @@ static void usbh_hub_events(struct usbh_hub *hub)
 
             /** check if debounce ok */
             if (debouncestable < HUB_DEBOUNCE_STABLE) {
+                if (hub->is_roothub) usbh_root_note(ROOT_ERROR, "debounce", -USB_ERR_TIMEOUT, 0);
                 USB_LOG_ERR("Failed to debounce port %u\r\n", port + 1);
-                break;
+                continue;
             }
 
             /* Last, check connect status */
             if (portstatus & HUB_PORT_STATUS_CONNECTION) {
-                ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
+                ret = usbh_hub_enumerate_port(hub, port + 1, retry ? 1 : HUB_ENUM_ATTEMPTS);
                 if (ret < 0) {
-                    USB_LOG_ERR("Failed to reset port %u,errorcode:%d\r\n", port, ret);
-                    continue;
-                }
-
-                usb_osal_msleep(DELAY_TIME_AFTER_RESET);
-                /* Read hub port status */
-                ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-                if (ret < 0) {
-                    USB_LOG_ERR("Failed to read port %u status, errorcode: %d\r\n", port + 1, ret);
-                    continue;
-                }
-
-                portstatus = port_status.wPortStatus;
-                portchange = port_status.wPortChange;
-                if (!(portstatus & HUB_PORT_STATUS_RESET) && (portstatus & HUB_PORT_STATUS_ENABLE)) {
-                    if (portchange & HUB_PORT_STATUS_C_RESET) {
-                        ret = usbh_hub_clear_feature(hub, port + 1, HUB_PORT_FEATURE_C_RESET);
-                        if (ret < 0) {
-                            USB_LOG_ERR("Failed to clear port %u reset change, errorcode: %d\r\n", port, ret);
-                        }
-                    }
-
-                    if (portstatus & HUB_PORT_STATUS_HIGH_SPEED) {
-                        speed = USB_SPEED_HIGH;
-                    } else if (portstatus & HUB_PORT_STATUS_LOW_SPEED) {
-                        speed = USB_SPEED_LOW;
-                    }
-#ifdef CONFIG_USBHOST_XHCI
-                    else {
-                        extern uint8_t usbh_get_port_speed(struct usbh_hub * hub, const uint8_t port);
-
-                        /* USB3.0 speed cannot get from portstatus, checkout port speed instead */
-                        uint8_t super_speed = usbh_get_port_speed(hub, port + 1);
-                        if (super_speed > USB_SPEED_HIGH) {
-                            /* assert that when using USB 3.0 ports, attached device must also be USB 3.0 speed */
-                            speed = super_speed;
-                        } else {
-                            speed = USB_SPEED_FULL;
-                        }
-                    }
-#else
-                    else {
-                        speed = USB_SPEED_FULL;
-                    }
-#endif
-
-                    child = &hub->child[port];
-                    /** release child sources first */
-                    usbh_hubport_release(child);
-
-                    usb_memset(child, 0, sizeof(struct usbh_hubport));
-                    child->parent = hub;
-                    child->connected = true;
-                    child->port = port + 1;
-                    child->speed = speed;
-                    child->bus = hub->bus;
-                    child->mutex = usb_osal_mutex_create();
-#ifdef CHERRY_USB_HC_DRV_DWC2
-                    if (hub->parent) {
-                        if (speed != USB_SPEED_HIGH &&
-                            hub->parent->speed == USB_SPEED_HIGH) {
-                            if (!hub->tt.hub) {
-                                USB_LOG_ERR("parent hub has no TT\n");
-                                continue;
-                            }
-                            child->tt = &hub->tt;
-                            child->ttport = port + 1;
-                        }
-                    } else {
-                        child->tt = &hub->tt;
-                        child->ttport = 1;
-                    }
-#endif
-                    USB_LOG_INFO("New %s device on Bus %u, Hub %u, Port %u connected\r\n", speed_table[speed], hub->bus->busid, hub->index, port + 1);
-
-                    /* create disposable thread to enumerate device on current hport, do not block hub thread */
-#if 0
-                    usb_osal_thread_create("usbh_enum", CONFIG_USBHOST_PSC_STACKSIZE, CONFIG_USBHOST_PSC_PRIO + 1, usbh_hubport_enumerate_thread, (void *)child);
-#else
-                    for (uint8_t enum_retry = 0; enum_retry < 3; enum_retry++) {
-                        /* A fast unplug/replug can report port enable before the
-                         * device is ready for the first EP0 descriptor read.
-                         * The removed printk path used to provide this settle
-                         * time implicitly. */
-                        usb_osal_msleep(DELAY_TIME_BEFORE_ENUMERATE);
-                        ret = usbh_enumerate(child);
-                        if (ret >= 0)
-                            break;
-
-                        if (ret == -USB_ERR_NOTCONN) {
-                            /* The device bounced away during the first GET_DESCRIPTOR.
-                             * Wait for the connect state to settle before re-resetting. */
-                            usb_osal_msleep(DELAY_TIME_ENUM_NOTCONN_BACKOFF);
-                        }
-
-                        USB_LOG_WRN("Port %u enumerate attempt %u failed (%d), re-resetting\r\n",
-                                    child->port, enum_retry + 1, ret);
-                        usbh_hubport_release(child);
-
-                        /* Re-reset the port so the PHY re-initialises */
-                        ret = usbh_hub_set_feature(hub, port + 1, HUB_PORT_FEATURE_RESET);
-                        if (ret < 0)
-                            break;
-                        usb_osal_msleep(DELAY_TIME_AFTER_RESET);
-
-                        /* Re-read port status after reset */
-                        ret = usbh_hub_get_portstatus(hub, port + 1, &port_status);
-                        if (ret < 0)
-                            break;
-                        portstatus = port_status.wPortStatus;
-                        if (!(portstatus & HUB_PORT_STATUS_ENABLE))
-                            break;
-
-                        usb_memset(child, 0, sizeof(struct usbh_hubport));
-                        child->parent = hub;
-                        child->connected = true;
-                        child->port = port + 1;
-                        child->speed = speed;
-                        child->bus = hub->bus;
-                        child->mutex = usb_osal_mutex_create();
-#ifdef CHERRY_USB_HC_DRV_DWC2
-                        if (hub->parent) {
-                            if (speed != USB_SPEED_HIGH &&
-                                hub->parent->speed == USB_SPEED_HIGH) {
-                                if (!hub->tt.hub)
-                                    break;
-                                child->tt = &hub->tt;
-                                child->ttport = port + 1;
-                            }
-                        } else {
-                            child->tt = &hub->tt;
-                            child->ttport = 1;
-                        }
-#endif
-                    }
-                    if (ret < 0) {
-                        usbh_hubport_release(child);
-                        USB_LOG_ERR("Port %u enumerate fail\r\n", child->port);
-                    }
-#endif
-                } else {
-                    child = &hub->child[port];
-                    /** release child sources */
-                    usbh_hubport_release(child);
-
-                    /** some USB 3.0 ip may failed to enable USB 2.0 port for USB 3.0 device */
-                    USB_LOG_WRN("Failed to enable port %u\r\n", port + 1);
-
-                    continue;
+                    if (hub->is_roothub) usbh_root_note(ROOT_ERROR, NULL, ret, 0);
+                    USB_LOG_ERR("Hub %u port %u enumerate failed: %d\r\n", hub->index, port + 1, ret);
                 }
             } else {
-                child = &hub->child[port];
-                /** release child sources */
                 usbh_hubport_release(child);
                 USB_LOG_INFO("Device on Bus %u, Hub %u, Port %u disconnected\r\n", hub->bus->busid, hub->index, port + 1);
             }
@@ -821,18 +824,40 @@ static void usbh_hub_thread(void *argument)
 
     struct usbh_bus *bus = (struct usbh_bus *)argument;
 
+    usbh_root_note(ROOT_WORKER, NULL, 0, 0);
+    uint8_t *root_retries = NULL;
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+    uint8_t retries[CONFIG_USBHOST_MAX_RHPORTS] = { 0 };
+    root_retries = retries;
+#endif
     while (1) {
-        ret = usb_osal_mq_recv(bus->hub_mq, (uintptr_t *)&hub, USB_OSAL_WAITING_FOREVER);
+        uint32_t wait = USB_OSAL_WAITING_FOREVER;
+        struct usbh_hub *root = &bus->hcd.roothub;
+        if (root_retries) {
+            for (uint8_t port = 0; port < root->hub_desc.bNbrPorts; port++) {
+                if (!root->child[port].connected) {
+                    wait = ROOT_RECHECK_MS;
+                    break;
+                }
+            }
+        }
+        ret = usb_osal_mq_recv(bus->hub_mq, (uintptr_t *)&hub, wait);
+        if (ret == -USB_ERR_TIMEOUT && wait != USB_OSAL_WAITING_FOREVER) {
+            usbh_hub_events(root, true, root_retries);
+            continue;
+        }
         if (ret < 0) {
             continue;
         }
-        usbh_hub_events(hub);
+        usbh_hub_events(hub, false, hub == root ? root_retries : NULL);
     }
 }
 
 void usbh_hub_thread_wakeup(struct usbh_hub *hub)
 {
-    usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+    int rc = usb_osal_mq_send(hub->bus->hub_mq, (uintptr_t)hub);
+    if (hub->is_roothub) usbh_root_note(ROOT_NOTIFY, NULL, rc, 0);
+    (void)rc;
 }
 
 int usbh_hub_initialize(struct usbh_bus *bus)
@@ -842,6 +867,7 @@ int usbh_hub_initialize(struct usbh_bus *bus)
 
     bus->hub_mq = usb_osal_mq_create(7);
     if (bus->hub_mq == NULL) {
+        usbh_root_note(ROOT_INIT, "queue", -USB_ERR_NOMEM, 0);
         USB_LOG_ERR("Failed to create hub mq\r\n");
         return -1;
     }
@@ -854,15 +880,18 @@ int usbh_hub_initialize(struct usbh_bus *bus)
         return ret;
     }
 
+    usbh_root_note(ROOT_INIT, "worker-create", 0, 0);
     snprintf(thread_name, 32, "usbh_hub%u", bus->busid);
     bus->hub_thread = usb_osal_thread_create(thread_name, CONFIG_USBHOST_PSC_STACKSIZE, CONFIG_USBHOST_PSC_PRIO, usbh_hub_thread, bus);
     if (bus->hub_thread == NULL) {
+        usbh_root_note(ROOT_INIT, "worker-create", -USB_ERR_NOMEM, 0);
         USB_LOG_ERR("Failed to create hub thread\r\n");
         usb_hc_deinit(bus);
         usb_osal_mq_delete(bus->hub_mq);
         bus->hub_mq = NULL;
         return -1;
     }
+    usbh_root_note(ROOT_INIT, "ready", 0, 0);
     return 0;
 }
 

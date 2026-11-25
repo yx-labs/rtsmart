@@ -265,6 +265,10 @@ static void dwc2_handle_conn_id_status_change_intr(struct dwc2_hsotg *hsotg)
  */
 static void dwc2_handle_disconnect_intr(struct dwc2_hsotg *hsotg)
 {
+#ifdef CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM
+    extern void dwc2_trace_startup_disconnect(struct dwc2_hsotg *hsotg);
+    dwc2_trace_startup_disconnect(hsotg);
+#endif
     dwc2_writel(hsotg, GINTSTS_DISCONNINT, GINTSTS);
 
 #if 0

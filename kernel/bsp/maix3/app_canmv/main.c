@@ -72,11 +72,17 @@ struct usbh_initialize_async_arg {
 
 static struct usbh_initialize_async_arg usbh_initialize_async_args;
 
+#include "usbh_root_diag.h"
+
 static void usbh_initialize_async_entry(void *parameter)
 {
   struct usbh_initialize_async_arg *arg = (struct usbh_initialize_async_arg *)parameter;
 
-  usbh_initialize(arg->busid, arg->reg_base);
+  usbh_root_note(ROOT_INIT, "async-running", 0, 0);
+  int rc = usbh_initialize(arg->busid, arg->reg_base);
+  if (rc < 0) {
+    rt_kprintf("Root hub initialization failed: %d\r\n", rc);
+  }
 }
 
 static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
@@ -86,6 +92,8 @@ static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
   usbh_initialize_async_args.busid = busid;
   usbh_initialize_async_args.reg_base = reg_base;
 
+  usbh_root_load_policy();
+  usbh_root_note(ROOT_INIT, "async-create", 0, 0);
   tid = rt_thread_create("usbh_init",
                          usbh_initialize_async_entry,
                          &usbh_initialize_async_args,
@@ -93,10 +101,12 @@ static int usbh_initialize_async(uint8_t busid, uint32_t reg_base)
                          RT_THREAD_PRIORITY_MAX - 1,
                          20);
   if (tid) {
-    rt_thread_startup(tid);
-    return 0;
+    int rc = rt_thread_startup(tid);
+    if (rc != RT_EOK) usbh_root_note(ROOT_INIT, "async-start", rc, 0);
+    return rc;
   }
 
+  usbh_root_note(ROOT_INIT, "sync-fallback", 0, 0);
   return usbh_initialize(busid, reg_base);
 }
 #endif

@@ -4,6 +4,7 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 #include "usbh_core.h"
+#include "usbh_root_diag.h"
 
 #undef USB_DBG_TAG
 #define USB_DBG_TAG "usbh_core"
@@ -40,20 +41,20 @@ static int usbh_allocate_devaddr(struct usbh_devaddr_map *devgen)
 
     for (;;) {
         devaddr = devgen->next;
-        if (devgen->next >= 0x7f) {
+        if (devgen->next >= USB_DEV_ADDR_MAX) {
             devgen->next = 2;
         } else {
             devgen->next++;
         }
 
-        index = devaddr >> 5;
-        bitno = devaddr & 0x1f;
-        if ((devgen->alloctab[index] & (1 << bitno)) == 0) {
-            devgen->alloctab[index] |= (1 << bitno);
+        index = devaddr >> USB_DEV_ADDR_MARK_OFFSET;
+        bitno = devaddr & USB_DEV_ADDR_MARK_MASK;
+        if ((devgen->alloctab[index] & (1u << bitno)) == 0) {
+            devgen->alloctab[index] |= (1u << bitno);
             return (int)devaddr;
         }
 
-        if (startaddr == devaddr) {
+        if (startaddr == devgen->next) {
             return -USB_ERR_NOMEM;
         }
     }
@@ -64,13 +65,13 @@ static int __usbh_free_devaddr(struct usbh_devaddr_map *devgen, uint8_t devaddr)
     int index;
     int bitno;
 
-    if ((devaddr > 0) && (devaddr < USB_DEV_ADDR_MAX)) {
+    if ((devaddr > 1) && (devaddr <= USB_DEV_ADDR_MAX)) {
         index = devaddr >> USB_DEV_ADDR_MARK_OFFSET;
         bitno = devaddr & USB_DEV_ADDR_MARK_MASK;
 
         /* Free the address  */
-        if ((devgen->alloctab[index] |= (1 << bitno)) != 0) {
-            devgen->alloctab[index] &= ~(1 << bitno);
+        if ((devgen->alloctab[index] & (1u << bitno)) != 0) {
+            devgen->alloctab[index] &= ~(1u << bitno);
         } else {
             return -1;
         }
@@ -431,6 +432,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /* Configure EP0 with zero address */
     hport->dev_addr = 0;
 
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "device8", 0, 0);
     /* Read the first 8 bytes of the device descriptor */
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = USB_REQUEST_GET_DESCRIPTOR;
@@ -444,7 +446,9 @@ int usbh_enumerate(struct usbh_hubport *hport)
         goto errout;
     }
 
-    parse_device_descriptor(hport, (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid], 8);
+    ret = parse_device_descriptor(hport, (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid], 8);
+    if (ret < 0)
+        goto errout;
 
     /* Extract the correct max packetsize from the device descriptor */
     dev_desc = (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid];
@@ -464,6 +468,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
         if ((hport->speed == USB_SPEED_LOW) ||
             !(ep_mps == 8 || ep_mps == 16 || ep_mps == 32 || ep_mps == 64)) {
             USB_LOG_ERR("Invalid ep0 maxpacket: %d\n", ep_mps);
+            ret = -USB_ERR_INVAL;
             goto errout;
         }
 
@@ -473,6 +478,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     }
 #endif
     ep->wMaxPacketSize = ep_mps;
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "alloc-address", 0, 0);
 
 #ifdef CONFIG_USBHOST_XHCI
     extern int usbh_get_xhci_devaddr(usbh_pipe_t * pipe);
@@ -480,6 +486,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /* Assign a function address to the device connected to this port */
     dev_addr = usbh_get_xhci_devaddr(hport->ep0);
     if (dev_addr < 0) {
+        ret = dev_addr;
         USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", ret);
         goto errout;
     }
@@ -487,11 +494,13 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /* Assign a function address to the device connected to this port */
     dev_addr = usbh_allocate_devaddr(&hport->bus->devgen);
     if (dev_addr < 0) {
+        ret = dev_addr;
         USB_LOG_ERR("Failed to allocate devaddr,errorcode:%d\r\n", ret);
         goto errout;
     }
 #endif
 
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "set-address", 0, 0);
     /* Set the USB device address */
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = USB_REQUEST_SET_ADDRESS;
@@ -502,6 +511,11 @@ int usbh_enumerate(struct usbh_hubport *hport)
     ret = usbh_control_transfer(hport, setup, NULL);
     if (ret < 0) {
         USB_LOG_ERR("Failed to set devaddr,errorcode:%d\r\n", ret);
+#ifndef CONFIG_USBHOST_XHCI
+        /* SET_ADDRESS is sent to address zero. The reserved address has
+         * not yet been copied to hport, so release it here on failure. */
+        __usbh_free_devaddr(&hport->bus->devgen, dev_addr);
+#endif
         goto errout;
     }
 
@@ -511,6 +525,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
     /*Reconfigure EP0 with the correct address */
     hport->dev_addr = dev_addr;
 
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "device18", 0, 0);
     /* Read the full device descriptor */
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = USB_REQUEST_GET_DESCRIPTOR;
@@ -537,13 +552,15 @@ int usbh_enumerate(struct usbh_hubport *hport)
     }
 
     dev_desc = (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid];
-    if (dev_desc->idVendor == 0 && dev_desc->idProduct == 0) {
+    if (dev_desc->idVendor == 0) {
         USB_LOG_ERR("Device descriptor still corrupt after retries\r\n");
         ret = -USB_ERR_INVAL;
         goto errout;
     }
 
-    parse_device_descriptor(hport, (struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid], USB_SIZEOF_DEVICE_DESC);
+    ret = parse_device_descriptor(hport, dev_desc, USB_SIZEOF_DEVICE_DESC);
+    if (ret < 0)
+        goto errout;
 
     idVendor = ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idVendor;
     idProduct = ((struct usb_device_descriptor *)ep0_request_buffer[hport->bus->busid])->idProduct;
@@ -562,6 +579,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
 
     USB_LOG_INFO("The device selects config %d\r\n", config_index);
 
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "config9", 0, 0);
     /* Read the first 9 bytes of the config descriptor */
     setup->bmRequestType = USB_REQUEST_DIR_IN | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = USB_REQUEST_GET_DESCRIPTOR;
@@ -584,9 +602,12 @@ int usbh_enumerate(struct usbh_hubport *hport)
         usb_osal_msleep(5);
     }
 
-    parse_config_descriptor(hport, (struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid], USB_SIZEOF_CONFIG_DESC);
+    ret = parse_config_descriptor(hport, (struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid], USB_SIZEOF_CONFIG_DESC);
+    if (ret < 0)
+        goto errout;
 
     /* Read the full size of the configuration data */
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "config-full", 0, 0);
     uint16_t wTotalLength = ((struct usb_configuration_descriptor *)ep0_request_buffer[hport->bus->busid])->wTotalLength;
 
     if (wTotalLength < USB_SIZEOF_CONFIG_DESC || wTotalLength > CONFIG_USBHOST_REQUEST_BUFFER_LEN) {
@@ -662,6 +683,7 @@ int usbh_enumerate(struct usbh_hubport *hport)
 
     USB_LOG_INFO("SerialNumber: %s\r\n", string_buffer);
 #endif
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "set-config", 0, 0);
     /* Select device configuration 1 */
     setup->bmRequestType = USB_REQUEST_DIR_OUT | USB_REQUEST_STANDARD | USB_REQUEST_RECIPIENT_DEVICE;
     setup->bRequest = USB_REQUEST_SET_CONFIGURATION;
@@ -688,6 +710,8 @@ int usbh_enumerate(struct usbh_hubport *hport)
         goto errout;
     }
 #endif
+    USBH_ROOT_PORT_NOTE(hport, ROOT_CONFIGURED, NULL, hport->dev_addr, ((uint32_t)idVendor << 16) | idProduct);
+    USBH_ROOT_PORT_NOTE(hport, ROOT_PHASE, "class-bind", 0, 0);
     USB_LOG_INFO("Enumeration success, start loading class driver\r\n");
     /*search supported class driver*/
     for (uint8_t i = 0; i < CONFIG_USBHOST_MAX_INTERFACES; i++) {
@@ -821,10 +845,19 @@ int usbh_control_transfer(struct usbh_hubport *hport, struct usb_setup_packet *s
 
     usb_memset(urb, 0, sizeof(struct usbh_urb));
     usbh_control_urb_fill(urb, hport, setup, buffer, setup->wLength, CONFIG_USBHOST_CONTROL_TRANSFER_TIMEOUT, NULL, NULL);
+#if defined(CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM) && defined(CHERRY_USB_HC_DRV_DWC2)
+    bool first8 = hport->parent && hport->parent->is_roothub && !hport->dev_addr &&
+        setup->bmRequestType == USB_REQUEST_DIR_IN && setup->bRequest == USB_REQUEST_GET_DESCRIPTOR &&
+        setup->wValue == (USB_DESCRIPTOR_TYPE_DEVICE << 8) && setup->wIndex == 0 && setup->wLength == 8;
+    if (first8) dwc2_trace_first_setup(hport->bus, 0, 0);
+#endif
     ret = usbh_submit_urb(urb);
     if (ret == 0) {
         ret = urb->actual_length;
     }
+#if defined(CHERRY_USB_HOST_ENABLE_CLASS_UAC1_PCM) && defined(CHERRY_USB_HC_DRV_DWC2)
+    if (first8) dwc2_trace_first_setup(hport->bus, 1, ret);
+#endif
 
     usb_osal_mutex_give(hport->mutex);
     return ret;

@@ -12,6 +12,7 @@
 #include <rtthread.h>
 #include <rtdevice.h>
 #include "usbh_core.h"
+#include "usbh_root_diag.h"
 #include "uac1_pcm.h"
 #include "uac1_profile.h"
 
@@ -406,9 +407,15 @@ INIT_DEVICE_EXPORT(pcm_init);
 static int audio_connect(struct usbh_hubport *port, uint8_t ctrl)
 {
     struct uac1_profile profile;
-    if (!pcm.initialized || port->speed != USB_SPEED_FULL || !port->parent ||
-        !port->parent->is_roothub ||
-        uac1_parse(port->raw_config_desc, port->config.config_desc.wTotalLength, ctrl, &profile)) {
+    const char *reject = NULL;
+    int rc = 0;
+    if (!pcm.initialized) reject = "pcm-init";
+    else if (port->speed != USB_SPEED_FULL) reject = "speed";
+    else if (!port->parent || !port->parent->is_roothub) reject = "downstream";
+    else if ((rc = uac1_parse(port->raw_config_desc, port->config.config_desc.wTotalLength, ctrl, &profile)) != 0)
+        reject = "profile";
+    if (reject) {
+        usbh_root_note(ROOT_UAC, reject, rc, pcm.port != NULL);
         /* An unmatched AudioControl interface must not fail enumeration of
          * independent interfaces (e.g. the HID buttons on a composite card). */
         port->config.intf[ctrl].class_driver = NULL;
@@ -416,11 +423,13 @@ static int audio_connect(struct usbh_hubport *port, uint8_t ctrl)
     }
     rt_mutex_take(&pcm.lock, RT_WAITING_FOREVER);
     if (pcm.port) {
+        usbh_root_note(ROOT_UAC, "busy", -EBUSY, 1);
         port->config.intf[ctrl].class_driver = NULL;
         rt_mutex_release(&pcm.lock);
         return 0;
     }
     pcm.port = port;
+    usbh_root_note(ROOT_UAC, "bound", 0, 1);
     pcm.profile = profile;
     ++pcm.generation;
     port->config.intf[ctrl].priv = &pcm;
@@ -439,6 +448,7 @@ static int audio_disconnect(struct usbh_hubport *port, uint8_t ctrl)
     stop_stream();
     pcm.owner = NULL; /* old fds never gain access to a replacement device */
     pcm.port = NULL;
+    usbh_root_note(ROOT_UAC, "released", 0, 0);
     pcm.dir = IDLE;
     ++pcm.generation;
     rt_memset(&pcm.profile, 0, sizeof(pcm.profile));
